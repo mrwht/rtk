@@ -34,6 +34,10 @@ struct FindArgs {
     max_results: usize,
     max_depth: Option<usize>,
     file_type: String,
+    /// True when the caller explicitly passed `-type`/`-t`. `file_type` otherwise
+    /// carries a silent "files only" default that must not suppress directories
+    /// truncated by `-maxdepth` (see `run`'s maxdepth-boundary handling).
+    type_explicit: bool,
     case_insensitive: bool,
 }
 
@@ -45,6 +49,7 @@ impl Default for FindArgs {
             max_results: 50,
             max_depth: None,
             file_type: "f".to_string(),
+            type_explicit: false,
             case_insensitive: false,
         }
     }
@@ -125,6 +130,7 @@ fn parse_native_find_args(args: &[String]) -> Result<FindArgs> {
             "-type" => {
                 if let Some(val) = next_arg(args, &mut i) {
                     parsed.file_type = val;
+                    parsed.type_explicit = true;
                 }
             }
             "-maxdepth" => {
@@ -167,6 +173,7 @@ fn parse_rtk_find_args(args: &[String]) -> Result<FindArgs> {
             "-t" | "--file-type" => {
                 if let Some(val) = next_arg(args, &mut i) {
                     parsed.file_type = val;
+                    parsed.type_explicit = true;
                 }
             }
             _ => {}
@@ -180,26 +187,18 @@ fn parse_rtk_find_args(args: &[String]) -> Result<FindArgs> {
 /// Entry point from main.rs — parses raw args then delegates to run().
 pub fn run_from_args(args: &[String], verbose: u8) -> Result<()> {
     let parsed = parse_find_args(args)?;
-    run(
-        &parsed.pattern,
-        &parsed.path,
-        parsed.max_results,
-        parsed.max_depth,
-        &parsed.file_type,
-        parsed.case_insensitive,
-        verbose,
-    )
+    run(&parsed, verbose)
 }
 
-pub fn run(
-    pattern: &str,
-    path: &str,
-    max_results: usize,
-    max_depth: Option<usize>,
-    file_type: &str,
-    case_insensitive: bool,
-    verbose: u8,
-) -> Result<()> {
+fn run(find_args: &FindArgs, verbose: u8) -> Result<()> {
+    let pattern = find_args.pattern.as_str();
+    let path = find_args.path.as_str();
+    let max_results = find_args.max_results;
+    let max_depth = find_args.max_depth;
+    let file_type = find_args.file_type.as_str();
+    let type_explicit = find_args.type_explicit;
+    let case_insensitive = find_args.case_insensitive;
+
     let timer = tracking::TimedExecution::start();
 
     // Treat "." as match-all
@@ -237,12 +236,22 @@ pub fn run(
         let ft = entry.file_type();
         let is_dir = ft.as_ref().is_some_and(|t| t.is_dir());
 
+        // A directory sitting exactly at the -maxdepth boundary can't be recursed
+        // into, so none of its contents will ever surface to reveal its existence
+        // (unlike the unbounded case, where nested files imply their parent dirs).
+        // Native find still lists it; do the same unless the caller explicitly
+        // asked for a specific -type (which we must respect literally).
+        let is_maxdepth_boundary_dir =
+            is_dir && !type_explicit && max_depth.is_some_and(|d| entry.depth() == d);
+
         // Filter by type
-        if want_dirs && !is_dir {
-            continue;
-        }
-        if !want_dirs && is_dir {
-            continue;
+        if !is_maxdepth_boundary_dir {
+            if want_dirs && !is_dir {
+                continue;
+            }
+            if !want_dirs && is_dir {
+                continue;
+            }
         }
 
         let entry_path = entry.path();
@@ -393,6 +402,19 @@ mod tests {
         values.iter().map(|s| s.to_string()).collect()
     }
 
+    /// Build a FindArgs for run() tests (type_explicit/case_insensitive default false).
+    fn find_args(pattern: &str, path: &str, max_results: usize, max_depth: Option<usize>, file_type: &str) -> FindArgs {
+        FindArgs {
+            pattern: pattern.to_string(),
+            path: path.to_string(),
+            max_results,
+            max_depth,
+            file_type: file_type.to_string(),
+            type_explicit: false,
+            case_insensitive: false,
+        }
+    }
+
     // --- glob_match unit tests ---
 
     #[test]
@@ -470,6 +492,23 @@ mod tests {
         assert_eq!(parsed.pattern, "*.toml");
         assert_eq!(parsed.max_depth, Some(2));
         assert_eq!(parsed.max_results, 50); // max_results unchanged by -maxdepth
+    }
+
+    #[test]
+    fn parse_native_find_maxdepth_without_type_is_not_explicit() {
+        // No -type flag given: file_type falls back to "f", but callers must be
+        // able to tell this apart from a literal `-type f` (see run()'s
+        // maxdepth-boundary override, which only fires when type is implicit).
+        let parsed = parse_find_args(&args(&[".", "-maxdepth", "1"])).unwrap();
+        assert_eq!(parsed.file_type, "f");
+        assert!(!parsed.type_explicit);
+    }
+
+    #[test]
+    fn parse_native_find_type_is_explicit_when_given() {
+        let parsed = parse_find_args(&args(&[".", "-type", "f", "-maxdepth", "1"])).unwrap();
+        assert_eq!(parsed.file_type, "f");
+        assert!(parsed.type_explicit);
     }
 
     #[test]
@@ -569,14 +608,14 @@ mod tests {
     #[test]
     fn find_dotfile_pattern_includes_hidden() {
         // .gitignore exists at the repo root — must be found when using a dotfile pattern
-        let result = run(".gitignore", ".", 50, Some(1), "f", false, 0);
+        let result = run(&find_args(".gitignore", ".", 50, Some(1), "f"), 0);
         assert!(result.is_ok(), "run with dotfile pattern should not error");
     }
 
     #[test]
     fn find_regular_pattern_skips_hidden() {
         // Non-dot pattern should not error (hidden dirs remain skipped)
-        let result = run("*.rs", "src", 5, None, "f", false, 0);
+        let result = run(&find_args("*.rs", "src", 5, None, "f"), 0);
         assert!(result.is_ok());
     }
 
@@ -585,34 +624,34 @@ mod tests {
     #[test]
     fn find_rs_files_in_src() {
         // Should find .rs files without error
-        let result = run("*.rs", "src", 100, None, "f", false, 0);
+        let result = run(&find_args("*.rs", "src", 100, None, "f"), 0);
         assert!(result.is_ok());
     }
 
     #[test]
     fn find_dot_pattern_works() {
         // "." pattern should not error (was broken before)
-        let result = run(".", "src", 10, None, "f", false, 0);
+        let result = run(&find_args(".", "src", 10, None, "f"), 0);
         assert!(result.is_ok());
     }
 
     #[test]
     fn find_no_matches() {
-        let result = run("*.xyz_nonexistent", "src", 50, None, "f", false, 0);
+        let result = run(&find_args("*.xyz_nonexistent", "src", 50, None, "f"), 0);
         assert!(result.is_ok());
     }
 
     #[test]
     fn find_respects_max() {
         // With max=2, should not error
-        let result = run("*.rs", "src", 2, None, "f", false, 0);
+        let result = run(&find_args("*.rs", "src", 2, None, "f"), 0);
         assert!(result.is_ok());
     }
 
     #[test]
     fn find_gitignored_excluded() {
         // target/ is in .gitignore — files inside should not appear
-        let result = run("*", ".", 1000, None, "f", false, 0);
+        let result = run(&find_args("*", ".", 1000, None, "f"), 0);
         assert!(result.is_ok());
         // We can't easily capture stdout in unit tests, but at least
         // verify it runs without error. The smoke tests verify content.

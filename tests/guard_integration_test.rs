@@ -148,6 +148,79 @@ fn find_no_results_emits_empty() {
 }
 
 #[test]
+fn find_maxdepth_still_shows_truncated_directories() {
+    // Regression: -maxdepth prevents recursing into matched subdirectories, so they
+    // had no children to surface them and were silently dropped from the output
+    // (unlike unbounded find, where nested files imply their parent dir exists).
+    // Native `find . -maxdepth 1` lists both files and immediate subdirectories;
+    // rtk must too, even though its default (no -type given) is files-only.
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("file1.txt"), "x").expect("write file1");
+    std::fs::write(dir.path().join("file2.txt"), "x").expect("write file2");
+    std::fs::create_dir_all(dir.path().join("sub1/deep")).expect("mkdir sub1/deep");
+    std::fs::create_dir_all(dir.path().join("sub2")).expect("mkdir sub2");
+    std::fs::write(dir.path().join("sub1/inner.txt"), "x").expect("write sub1/inner");
+    std::fs::write(dir.path().join("sub1/deep/x.txt"), "x").expect("write sub1/deep/x");
+    std::fs::write(dir.path().join("sub2/inner2.txt"), "x").expect("write sub2/inner2");
+
+    let (out, _) = rtk_in_dir(dir.path(), &["find", ".", "-maxdepth", "1"]);
+    assert!(
+        out.contains("sub1"),
+        "sub1 dropped from maxdepth-truncated output: {out:?}"
+    );
+    assert!(
+        out.contains("sub2"),
+        "sub2 dropped from maxdepth-truncated output: {out:?}"
+    );
+    assert!(
+        out.contains("file1.txt"),
+        "file1.txt missing from output: {out:?}"
+    );
+    assert!(
+        out.contains("file2.txt"),
+        "file2.txt missing from output: {out:?}"
+    );
+
+    // The all-subdirectories case is the worst manifestation: with no files at all,
+    // the old behavior emitted completely empty output for a full directory.
+    let dirsonly = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dirsonly.path().join("a/nested")).expect("mkdir a/nested");
+    std::fs::create_dir_all(dirsonly.path().join("b")).expect("mkdir b");
+    std::fs::write(dirsonly.path().join("a/nested/f.txt"), "x").expect("write a/nested/f");
+
+    let (out2, _) = rtk_in_dir(dirsonly.path(), &["find", ".", "-maxdepth", "1"]);
+    assert!(
+        !out2.trim().is_empty(),
+        "an all-subdirectory tree must not report empty output under -maxdepth"
+    );
+    assert!(
+        out2.contains('a'),
+        "dir 'a' dropped from maxdepth-truncated output: {out2:?}"
+    );
+    assert!(
+        out2.contains('b'),
+        "dir 'b' dropped from maxdepth-truncated output: {out2:?}"
+    );
+}
+
+#[test]
+fn find_maxdepth_with_explicit_type_f_still_hides_directories() {
+    // When the caller explicitly asks for -type f, directories must stay hidden
+    // even at the maxdepth boundary — the override is only for the unspecified
+    // (files-only-by-default) case, not a literal -type f request.
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("file1.txt"), "x").expect("write file1");
+    std::fs::create_dir_all(dir.path().join("sub1")).expect("mkdir sub1");
+
+    let (out, _) = rtk_in_dir(dir.path(), &["find", ".", "-type", "f", "-maxdepth", "1"]);
+    assert!(out.contains("file1.txt"), "file1.txt missing: {out:?}");
+    assert!(
+        !out.contains("sub1"),
+        "explicit -type f must not surface directories: {out:?}"
+    );
+}
+
+#[test]
 fn git_stash_list_no_stashes_emits_empty() {
     let dir = init_git_repo();
     let (out, code) = rtk_in_dir(dir.path(), &["git", "stash", "list"]);
